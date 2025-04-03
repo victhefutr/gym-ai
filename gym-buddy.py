@@ -45,21 +45,40 @@ class GymBuddy:
         
         # Initialize MediaPipe Pose with lower thresholds
         self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(min_detection_confidence=0.3, min_tracking_confidence=0.3)
+        self.pose = self.mp_pose.Pose(
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.3,
+            model_complexity=0  # Faster, lighter model
+        )
         self.mp_drawing = mp.solutions.drawing_utils
         
-        # Custom drawing specs for landmarks
-        self.bicep_curl_connections = frozenset([
-            (self.mp_pose.PoseLandmark.RIGHT_SHOULDER, self.mp_pose.PoseLandmark.RIGHT_ELBOW),
-            (self.mp_pose.PoseLandmark.RIGHT_ELBOW, self.mp_pose.PoseLandmark.RIGHT_WRIST)
-        ])
+        # Key points for bicep curl
+        self.key_points = {
+            'shoulder': self.mp_pose.PoseLandmark.RIGHT_SHOULDER,
+            'elbow': self.mp_pose.PoseLandmark.RIGHT_ELBOW,
+            'wrist': self.mp_pose.PoseLandmark.RIGHT_WRIST
+        }
         
-        # Custom landmark drawing styles
-        self.custom_drawing_spec = self.mp_drawing.DrawingSpec(
-            color=(0, 255, 0),  # Green color
-            thickness=3,
-            circle_radius=5
+        # Custom drawing specs
+        self.point_spec = self.mp_drawing.DrawingSpec(
+            color=(0, 255, 0),  # Green
+            thickness=5,
+            circle_radius=8
         )
+        self.line_spec = self.mp_drawing.DrawingSpec(
+            color=(255, 255, 0),  # Yellow
+            thickness=4
+        )
+        self.guide_spec = self.mp_drawing.DrawingSpec(
+            color=(150, 150, 150),  # Gray
+            thickness=2,
+            circle_radius=2
+        )
+        
+        # Visual guide parameters
+        self.guide_radius = 50  # Pixels
+        self.last_valid_points = {}
+        self.confidence_threshold = 0.7
         
         # Exercise tracking variables
         self.angle_history = []  # Store recent angles for smoothing
@@ -579,14 +598,42 @@ class GymBuddy:
         if results.pose_landmarks:
             self.check_bicep_curl_position(results.pose_landmarks.landmark)
             
-            # Draw only right arm landmarks with custom style
-            self.mp_drawing.draw_landmarks(
-                rgb_frame,
-                results.pose_landmarks,
-                self.bicep_curl_connections,
-                landmark_drawing_spec=self.custom_drawing_spec,
-                connection_drawing_spec=self.custom_drawing_spec
-            )
+            # Get points and draw landmarks
+            points = self.check_bicep_curl_position(results.pose_landmarks.landmark)
+            if points:
+                # Draw arm segments
+                cv2.line(rgb_frame, 
+                    (int(points['shoulder'].x * rgb_frame.shape[1]), int(points['shoulder'].y * rgb_frame.shape[0])),
+                    (int(points['elbow'].x * rgb_frame.shape[1]), int(points['elbow'].y * rgb_frame.shape[0])),
+                    self.line_spec.color, self.line_spec.thickness)
+                cv2.line(rgb_frame,
+                    (int(points['elbow'].x * rgb_frame.shape[1]), int(points['elbow'].y * rgb_frame.shape[0])),
+                    (int(points['wrist'].x * rgb_frame.shape[1]), int(points['wrist'].y * rgb_frame.shape[0])),
+                    self.line_spec.color, self.line_spec.thickness)
+                
+                # Draw key points
+                for point in points.values():
+                    cv2.circle(rgb_frame,
+                        (int(point.x * rgb_frame.shape[1]), int(point.y * rgb_frame.shape[0])),
+                        self.point_spec.circle_radius,
+                        self.point_spec.color,
+                        self.point_spec.thickness)
+                
+                # Draw guide circles for proper form
+                if not self.rep_in_progress:
+                    # Starting position guide
+                    cv2.circle(rgb_frame,
+                        (int(points['wrist'].x * rgb_frame.shape[1]), int(rgb_frame.shape[0] * 0.8)),
+                        self.guide_radius,
+                        self.guide_spec.color,
+                        self.guide_spec.thickness)
+                elif not self.curl_started:
+                    # Curl up position guide
+                    cv2.circle(rgb_frame,
+                        (int(points['wrist'].x * rgb_frame.shape[1]), int(rgb_frame.shape[0] * 0.3)),
+                        self.guide_radius,
+                        self.guide_spec.color,
+                        self.guide_spec.thickness)
         
         # Convert the frame for display (minimal processing)
         frame = cv2.resize(rgb_frame, (960, 540))  # Larger size
@@ -703,20 +750,39 @@ class GymBuddy:
 
         
     def check_bicep_curl_position(self, landmarks):
-        # Get key landmarks for bicep curl detection (use right arm)
-        shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
-        elbow = landmarks[self.mp_pose.PoseLandmark.RIGHT_ELBOW.value]
-        wrist = landmarks[self.mp_pose.PoseLandmark.RIGHT_WRIST.value]
+        # Get key landmarks with visibility check
+        points = {}
+        all_visible = True
+        for name, landmark_type in self.key_points.items():
+            point = landmarks[landmark_type.value]
+            if point.visibility > self.confidence_threshold:
+                points[name] = point
+                self.last_valid_points[name] = (point.x, point.y)
+            else:
+                if name in self.last_valid_points:
+                    # Use last known position if point is temporarily lost
+                    x, y = self.last_valid_points[name]
+                    points[name] = type('Point', (), {'x': x, 'y': y})
+                else:
+                    all_visible = False
+                    break
+        
+        if not all_visible:
+            self.current_message = "Position your right arm in view"
+            self.message_timer = time.time()
+            return
         
         # Calculate elbow angle
-        angle = self.calculate_angle((shoulder.x, shoulder.y), (elbow.x, elbow.y), (wrist.x, wrist.y))
+        angle = self.calculate_angle(
+            (points['shoulder'].x, points['shoulder'].y),
+            (points['elbow'].x, points['elbow'].y),
+            (points['wrist'].x, points['wrist'].y)
+        )
         
-        # Add angle to history and maintain history size
+        # Angle smoothing
         self.angle_history.append(angle)
         if len(self.angle_history) > self.history_size:
             self.angle_history.pop(0)
-        
-        # Get smoothed angle
         smoothed_angle = sum(self.angle_history) / len(self.angle_history)
         
         # Define thresholds
@@ -731,30 +797,29 @@ class GymBuddy:
         
         # State machine for rep counting
         if not self.rep_in_progress:
-            # Check if starting a new rep
             if smoothed_angle > CURL_START_ANGLE:
                 self.rep_in_progress = True
                 self.max_angle = smoothed_angle
                 self.min_angle = smoothed_angle
-                self.current_message = "Starting curl..."
+                self.current_message = "Good starting position - now curl up!"
                 self.message_timer = time.time()
         else:
-            # Check if completing a rep
-            if smoothed_angle > CURL_START_ANGLE:
-                # Check if the range of motion was sufficient
+            if smoothed_angle < CURL_END_ANGLE and not self.curl_started:
+                self.curl_started = True
+                self.current_message = "Great! Now lower slowly"
+                self.message_timer = time.time()
+            elif smoothed_angle > CURL_START_ANGLE and self.curl_started:
                 range_of_motion = self.max_angle - self.min_angle
-                if range_of_motion > MIN_ROM and self.min_angle < CURL_END_ANGLE:
+                if range_of_motion > MIN_ROM:
                     self.exercise_count += 1
-                    if self.exercise_count == 5:
-                        self.current_message = "Feel those biceps burn! Keep going!"
-                    elif self.exercise_count == 10:
-                        self.current_message = "Great form! You're getting stronger!"
-                    else:
-                        self.current_message = f"Good rep! Range of motion: {range_of_motion:.1f}°"
+                    self.current_message = f"Perfect rep! ROM: {range_of_motion:.1f}°"
                 else:
-                    self.current_message = "Incomplete rep - curl deeper!"
+                    self.current_message = "Curl higher next time!"
                 self.message_timer = time.time()
                 self.rep_in_progress = False
+                self.curl_started = False
+        
+        return points  # Return points for drawing
     
     def run_ab_crunch_counter(self):
         # Read camera feed
