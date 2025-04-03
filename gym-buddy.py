@@ -61,7 +61,13 @@ class GymBuddy:
             circle_radius=5
         )
         
-        # Workout variables
+        # Exercise tracking variables
+        self.angle_history = []  # Store recent angles for smoothing
+        self.history_size = 5    # Number of frames to average
+        self.curl_started = False
+        self.max_angle = 0       # Track maximum angle in current rep
+        self.min_angle = 180     # Track minimum angle in current rep
+        self.rep_in_progress = False
         self.current_exercise = None
         self.exercise_count = 0
         self.target_count = 0
@@ -70,6 +76,8 @@ class GymBuddy:
         self.plank_target_duration = 60  # Default 60 seconds
         self.is_in_position = False
         self.prev_position = False
+        
+        # Messaging system
         self.motivational_messages = [
             "You're doing great! Keep it up!",
             "Stay strong! You've got this!",
@@ -692,6 +700,8 @@ class GymBuddy:
         # Return to main menu button
         self.draw_button(500, 500, 300, 100, "RETURN TO MENU", self.PURPLE, self.LIGHT_PURPLE)
 
+
+        
     def check_bicep_curl_position(self, landmarks):
         # Get key landmarks for bicep curl detection (use right arm)
         shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
@@ -701,25 +711,50 @@ class GymBuddy:
         # Calculate elbow angle
         angle = self.calculate_angle((shoulder.x, shoulder.y), (elbow.x, elbow.y), (wrist.x, wrist.y))
         
-        # Bicep curl logic: When a person curls, the elbow angle decreases and then increases
-        # We count a rep when the angle goes below the threshold and then back above
-        current_position = angle < 90  # Curled position
+        # Add angle to history and maintain history size
+        self.angle_history.append(angle)
+        if len(self.angle_history) > self.history_size:
+            self.angle_history.pop(0)
         
-        if current_position and not self.prev_position:
-            # Starting a curl
-            self.prev_position = True
-        elif not current_position and self.prev_position:
-            # Finishing a curl
-            self.exercise_count += 1
-            self.prev_position = False
-            
-            # Show message at certain milestones
-            if self.exercise_count == 5:
-                self.current_message = "Feel those biceps burn! Keep going!"
+        # Get smoothed angle
+        smoothed_angle = sum(self.angle_history) / len(self.angle_history)
+        
+        # Define thresholds
+        CURL_START_ANGLE = 150   # Arm must be this straight to start
+        CURL_END_ANGLE = 50      # Arm must curl this much to count
+        MIN_ROM = 70            # Minimum range of motion required
+        
+        # Update max and min angles during the rep
+        if self.rep_in_progress:
+            self.max_angle = max(self.max_angle, smoothed_angle)
+            self.min_angle = min(self.min_angle, smoothed_angle)
+        
+        # State machine for rep counting
+        if not self.rep_in_progress:
+            # Check if starting a new rep
+            if smoothed_angle > CURL_START_ANGLE:
+                self.rep_in_progress = True
+                self.max_angle = smoothed_angle
+                self.min_angle = smoothed_angle
+                self.current_message = "Starting curl..."
                 self.message_timer = time.time()
-            elif self.exercise_count == 10:
-                self.current_message = "Great form! You're getting stronger!"
+        else:
+            # Check if completing a rep
+            if smoothed_angle > CURL_START_ANGLE:
+                # Check if the range of motion was sufficient
+                range_of_motion = self.max_angle - self.min_angle
+                if range_of_motion > MIN_ROM and self.min_angle < CURL_END_ANGLE:
+                    self.exercise_count += 1
+                    if self.exercise_count == 5:
+                        self.current_message = "Feel those biceps burn! Keep going!"
+                    elif self.exercise_count == 10:
+                        self.current_message = "Great form! You're getting stronger!"
+                    else:
+                        self.current_message = f"Good rep! Range of motion: {range_of_motion:.1f}°"
+                else:
+                    self.current_message = "Incomplete rep - curl deeper!"
                 self.message_timer = time.time()
+                self.rep_in_progress = False
     
     def run_ab_crunch_counter(self):
         # Read camera feed
